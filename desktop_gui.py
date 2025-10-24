@@ -28,6 +28,9 @@ from core import (
 )
 
 
+CST = timezone(timedelta(hours=-6), name="CST")
+
+
 class DesktopApp:
     """Encapsulates the Tkinter widgets and interactions."""
 
@@ -123,7 +126,7 @@ class DesktopApp:
         fetch_frame = ttk.LabelFrame(main, text="Time range & Data", padding=10)
         fetch_frame.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
 
-        now = datetime.now(tz=timezone.utc)
+        now = datetime.now(tz=CST)
         default_start = now - timedelta(days=1)
         self.start_var = tk.StringVar(value=default_start.isoformat())
         self.end_var = tk.StringVar(value=now.isoformat())
@@ -138,6 +141,11 @@ class DesktopApp:
         ttk.Entry(fetch_frame, textvariable=self.end_var).grid(
             row=1, column=1, sticky="ew"
         )
+        ttk.Button(
+            fetch_frame,
+            text="Choose…",
+            command=self._open_time_popup,
+        ).grid(row=0, column=2, rowspan=2, padx=(8, 0))
         ttk.Label(fetch_frame, text="Max docs").grid(row=2, column=0, sticky="w")
         ttk.Entry(fetch_frame, textvariable=self.max_docs_var).grid(
             row=2, column=1, sticky="ew"
@@ -239,6 +247,182 @@ class DesktopApp:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+    def _duration_to_timedelta(self, value: str, unit: str) -> timedelta:
+        try:
+            amount = float(value)
+        except ValueError:
+            raise ValueError("Enter a numeric duration") from None
+
+        if amount < 0:
+            raise ValueError("Duration must be non-negative")
+
+        unit = unit.lower()
+        if unit in {"minute", "minutes"}:
+            return timedelta(minutes=amount)
+        if unit in {"hour", "hours"}:
+            return timedelta(hours=amount)
+        if unit in {"day", "days"}:
+            return timedelta(days=amount)
+        if unit in {"week", "weeks"}:
+            return timedelta(weeks=amount)
+
+        raise ValueError(f"Unsupported unit: {unit}")
+
+    def _open_time_popup(self) -> None:
+        popup = tk.Toplevel(self.root)
+        popup.title("Select time range")
+        popup.transient(self.root)
+        popup.grab_set()
+
+        mode_var = tk.StringVar(value="absolute")
+
+        container = ttk.Frame(popup, padding=10)
+        container.grid(row=0, column=0, sticky="nsew")
+
+        popup.columnconfigure(0, weight=1)
+        popup.rowconfigure(0, weight=1)
+
+        ttk.Label(container, text="Mode").grid(row=0, column=0, sticky="w")
+        mode_frame = ttk.Frame(container)
+        mode_frame.grid(row=0, column=1, sticky="w")
+        ttk.Radiobutton(
+            mode_frame,
+            text="Absolute",
+            value="absolute",
+            variable=mode_var,
+        ).grid(row=0, column=0, padx=(0, 8))
+        ttk.Radiobutton(
+            mode_frame,
+            text="Relative",
+            value="relative",
+            variable=mode_var,
+        ).grid(row=0, column=1)
+
+        abs_frame = ttk.LabelFrame(container, text="Absolute range (CST)", padding=10)
+        abs_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
+
+        abs_start_var = tk.StringVar(value=self.start_var.get())
+        abs_end_var = tk.StringVar(value=self.end_var.get())
+
+        ttk.Label(abs_frame, text="Start").grid(row=0, column=0, sticky="w")
+        ttk.Entry(abs_frame, textvariable=abs_start_var, width=35).grid(
+            row=0, column=1, sticky="ew"
+        )
+        ttk.Label(abs_frame, text="End").grid(row=1, column=0, sticky="w")
+        ttk.Entry(abs_frame, textvariable=abs_end_var, width=35).grid(
+            row=1, column=1, sticky="ew"
+        )
+
+        abs_frame.columnconfigure(1, weight=1)
+
+        rel_frame = ttk.LabelFrame(container, text="Relative range (from now)", padding=10)
+        rel_frame.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
+
+        rel_length_var = tk.StringVar(value="1")
+        rel_length_unit_var = tk.StringVar(value="days")
+        rel_offset_var = tk.StringVar(value="0")
+        rel_offset_unit_var = tk.StringVar(value="minutes")
+
+        ttk.Label(rel_frame, text="Duration").grid(row=0, column=0, sticky="w")
+        ttk.Entry(rel_frame, textvariable=rel_length_var, width=8).grid(
+            row=0, column=1, sticky="w"
+        )
+        ttk.Combobox(
+            rel_frame,
+            textvariable=rel_length_unit_var,
+            values=("minutes", "hours", "days", "weeks"),
+            state="readonly",
+            width=10,
+        ).grid(row=0, column=2, padx=(6, 0))
+
+        ttk.Label(rel_frame, text="End offset").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(rel_frame, textvariable=rel_offset_var, width=8).grid(
+            row=1, column=1, sticky="w", pady=(6, 0)
+        )
+        ttk.Combobox(
+            rel_frame,
+            textvariable=rel_offset_unit_var,
+            values=("minutes", "hours", "days", "weeks"),
+            state="readonly",
+            width=10,
+        ).grid(row=1, column=2, padx=(6, 0), pady=(6, 0))
+
+        rel_frame.columnconfigure(3, weight=1)
+
+        def _set_state(frame: ttk.LabelFrame, enabled: bool) -> None:
+            for child in frame.winfo_children():
+                try:
+                    if isinstance(child, ttk.Combobox):
+                        child.configure(state="readonly" if enabled else "disabled")
+                    else:
+                        child.configure(state="normal" if enabled else "disabled")
+                except tk.TclError:
+                    # Widgets like labels might not support state changes; ignore.
+                    pass
+
+        def update_mode() -> None:
+            use_absolute = mode_var.get() == "absolute"
+            _set_state(abs_frame, use_absolute)
+            _set_state(rel_frame, not use_absolute)
+
+        update_mode()
+        mode_var.trace_add("write", lambda *_: update_mode())
+
+        def apply_time_range() -> None:
+            try:
+                if mode_var.get() == "absolute":
+                    start_text = abs_start_var.get().strip()
+                    end_text = abs_end_var.get().strip()
+                    if not start_text or not end_text:
+                        raise ValueError("Both start and end are required")
+
+                    start_dt = dateparser.parse(start_text)
+                    end_dt = dateparser.parse(end_text)
+                    if start_dt is None or end_dt is None:
+                        raise ValueError("Unable to parse provided timestamps")
+
+                    if start_dt.tzinfo is None:
+                        start_dt = start_dt.replace(tzinfo=CST)
+                    else:
+                        start_dt = start_dt.astimezone(CST)
+
+                    if end_dt.tzinfo is None:
+                        end_dt = end_dt.replace(tzinfo=CST)
+                    else:
+                        end_dt = end_dt.astimezone(CST)
+
+                else:
+                    duration = self._duration_to_timedelta(
+                        rel_length_var.get(), rel_length_unit_var.get()
+                    )
+                    end_offset = self._duration_to_timedelta(
+                        rel_offset_var.get(), rel_offset_unit_var.get()
+                    )
+
+                    now_cst = datetime.now(tz=CST)
+                    end_dt = now_cst - end_offset
+                    start_dt = end_dt - duration
+
+                if start_dt >= end_dt:
+                    raise ValueError("Start must be before end")
+
+            except ValueError as exc:
+                messagebox.showerror("Invalid time range", str(exc), parent=popup)
+                return
+
+            self.start_var.set(start_dt.isoformat())
+            self.end_var.set(end_dt.isoformat())
+            popup.destroy()
+
+        buttons = ttk.Frame(container)
+        buttons.grid(row=3, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        ttk.Button(buttons, text="Cancel", command=popup.destroy).grid(row=0, column=0)
+        ttk.Button(buttons, text="Apply", command=apply_time_range).grid(
+            row=0, column=1, padx=(8, 0)
+        )
+
+        popup.wait_window()
+
     def _parse_datetime(self, value: str) -> Optional[datetime]:
         if not value.strip():
             return None
@@ -246,9 +430,9 @@ class DesktopApp:
         if not dt:
             raise ValueError(f"Could not parse datetime: {value}")
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+            dt = dt.replace(tzinfo=CST)
         else:
-            dt = dt.astimezone(timezone.utc)
+            dt = dt.astimezone(CST)
         return dt
 
     def _selected_columns(self) -> List[str]:

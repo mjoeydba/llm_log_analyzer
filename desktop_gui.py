@@ -83,6 +83,7 @@ class DesktopApp:
         self.username_var = tk.StringVar()
         self.password_var = tk.StringVar()
         self.api_key_var = tk.StringVar()
+        self.ca_certs_var = tk.StringVar()
         self.auth_mode = tk.StringVar(value="none")
 
         ttk.Label(conn_frame, text="Auth mode").grid(row=4, column=0, sticky="w")
@@ -107,8 +108,13 @@ class DesktopApp:
             row=7, column=1, sticky="ew"
         )
 
+        ttk.Label(conn_frame, text="CA bundle path").grid(row=8, column=0, sticky="w")
+        ttk.Entry(conn_frame, textvariable=self.ca_certs_var, width=40).grid(
+            row=8, column=1, sticky="ew"
+        )
+
         ttk.Button(conn_frame, text="Connect", command=self.connect).grid(
-            row=8, column=0, columnspan=2, pady=(8, 0)
+            row=9, column=0, columnspan=2, pady=(8, 0)
         )
 
         conn_frame.columnconfigure(1, weight=1)
@@ -283,13 +289,17 @@ class DesktopApp:
         elif mode == "api_key":
             api_key = self.api_key_var.get().strip() or None
 
+        ca_bundle = self.ca_certs_var.get().strip() or None
+        verify_certs = bool(ca_bundle)
+
         try:
             self.es_client = connect_es(
                 host=host,
                 username=username,
                 password=password,
                 api_key=api_key,
-                verify_certs=False,
+                verify_certs=verify_certs,
+                ca_certs_path=ca_bundle,
             )
             self.status_var.set("Connected to Elasticsearch")
         except Exception as exc:  # pragma: no cover - GUI feedback

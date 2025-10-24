@@ -6,6 +6,7 @@ from typing import Dict, List, Optional
 import pandas as pd
 import requests
 from elasticsearch import Elasticsearch
+from elasticsearch.exceptions import AuthorizationException
 from elasticsearch.helpers import scan
 
 
@@ -81,17 +82,26 @@ def connect_es(
     elif username:
         kwargs["basic_auth"] = (username, password or "")
 
-    try:
-        es = Elasticsearch(**kwargs)
-        _ = es.info()
+    def _instantiate(client_kwargs: Dict[str, object]) -> Elasticsearch:
+        es = Elasticsearch(**client_kwargs)
+        try:
+            es.info()
+        except AuthorizationException as exc:
+            status = getattr(exc, "status_code", None)
+            if status == 403:
+                # Users without cluster monitor privileges should still be able to
+                # connect if their credentials are otherwise valid.
+                return es
+            raise
         return es
+
+    try:
+        return _instantiate(kwargs)
     except TypeError:
         if "basic_auth" in kwargs:
             http_auth = kwargs.pop("basic_auth")
             kwargs["http_auth"] = http_auth
-        es = Elasticsearch(**kwargs)
-        _ = es.info()
-        return es
+        return _instantiate(kwargs)
 
 
 def build_query(

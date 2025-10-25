@@ -105,11 +105,22 @@ with colq2:
     start_dt = end_dt = issue_dt = None
 
     if time_mode == "Absolute range":
-        window = st.date_input(
-            "Base period dates (for single-period analysis)",
-            value=(default_start.date(), now.date()),
-            key="abs_dates"
-        )
+        col_abs_dates = st.columns(2)
+        with col_abs_dates[0]:
+            start_date = st.date_input(
+                "Start date",
+                value=default_start.date(),
+                key="abs_start_date",
+                help="Click to open a calendar picker for the range start."
+            )
+        with col_abs_dates[1]:
+            end_date = st.date_input(
+                "End date",
+                value=now.date(),
+                key="abs_end_date",
+                help="Click to open a calendar picker for the range end."
+            )
+
         # To capture precise times, add time inputs
         col_t1, col_t2 = st.columns(2)
         with col_t1:
@@ -118,8 +129,8 @@ with colq2:
             end_time = st.time_input("End time (UTC)", value=now.time(), key="abs_end_time")
 
         try:
-            start_dt = datetime.combine(window[0], start_time, tzinfo=timezone.utc)
-            end_dt = datetime.combine(window[1], end_time, tzinfo=timezone.utc)
+            start_dt = datetime.combine(start_date, start_time, tzinfo=timezone.utc)
+            end_dt = datetime.combine(end_date, end_time, tzinfo=timezone.utc)
         except Exception:
             start_dt = end_dt = None
 
@@ -134,20 +145,43 @@ with colq2:
             value=now.time(),
             key="issue_time"
         )
-        minutes_before = st.number_input(
-            "Minutes before issue",
-            min_value=0,
-            value=60,
-            step=5,
-            key="minutes_before_issue"
+        relative_input_mode = st.radio(
+            "Relative window input",
+            ["Number fields", "Slider"],
+            horizontal=True,
+            key="relative_input_mode",
+            help="Choose between numeric inputs or a slider to control the minutes before/after the issue time."
         )
-        minutes_after = st.number_input(
-            "Minutes after issue",
-            min_value=0,
-            value=60,
-            step=5,
-            key="minutes_after_issue"
-        )
+
+        if relative_input_mode == "Slider":
+            slider_min = -24 * 60
+            slider_max = 24 * 60
+            offset_range = st.slider(
+                "Window offsets (minutes)",
+                min_value=slider_min,
+                max_value=slider_max,
+                value=(-60, 60),
+                step=5,
+                key="issue_window_slider",
+                help="Drag the handles to pick how many minutes before and after the issue time to search."
+            )
+            minutes_before = abs(min(offset_range[0], 0))
+            minutes_after = max(offset_range[1], 0)
+        else:
+            minutes_before = st.number_input(
+                "Minutes before issue",
+                min_value=0,
+                value=60,
+                step=5,
+                key="minutes_before_issue"
+            )
+            minutes_after = st.number_input(
+                "Minutes after issue",
+                min_value=0,
+                value=60,
+                step=5,
+                key="minutes_after_issue"
+            )
 
         try:
             issue_dt = datetime.combine(issue_date, issue_time, tzinfo=timezone.utc)

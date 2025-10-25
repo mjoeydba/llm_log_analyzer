@@ -1,13 +1,21 @@
 import json
+import logging
 import math
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import pandas as pd
 import requests
 from elasticsearch import Elasticsearch
 from elasticsearch.exceptions import AuthorizationException
 from elasticsearch.helpers import scan
+
+
+logger = logging.getLogger("llm_log_analyzer.core")
+
+
+class RequestCancelled(Exception):
+    """Raised when a long-running Elasticsearch request is cancelled."""
 
 
 def ollama_generate(
@@ -43,6 +51,7 @@ def ollama_generate(
         return "".join(out)
 
     except Exception:
+        logger.warning("Falling back to HTTP request for Ollama generate", exc_info=True)
         url = f"{host.rstrip('/')}/api/generate"
         payload = {
             "model": model,
@@ -95,6 +104,7 @@ def connect_es(
             raise
         return es
 
+    logger.info("Connecting to Elasticsearch host=%s verify_certs=%s", host, verify_certs)
     try:
         return _instantiate(kwargs)
     except TypeError:
@@ -148,6 +158,7 @@ def fetch_dataframe(
     max_docs: int = 5000,
     sample_only: bool = False,
     sample_size: int = 1000,
+    cancel_callback: Optional[Callable[[], bool]] = None,
 ) -> pd.DataFrame:
     """Fetch documents from Elasticsearch and return as a flattened DataFrame."""
 
@@ -157,18 +168,37 @@ def fetch_dataframe(
         body["_source"] = source_includes
 
     docs: List[Dict] = []
-    for hit in scan(es, index=index, query=body, size=size, scroll="2m"):
-        src = hit.get("_source", {})
-        docs.append(src)
-        if not sample_only and len(docs) >= max_docs:
-            break
-        if sample_only and len(docs) >= sample_size:
-            break
+    logger.info(
+        "Starting Elasticsearch scan index=%s sample_only=%s max_docs=%s sample_size=%s",
+        index,
+        sample_only,
+        max_docs,
+        sample_size,
+    )
+    try:
+        for hit in scan(es, index=index, query=body, size=size, scroll="2m"):
+            if cancel_callback and cancel_callback():
+                logger.info("Elasticsearch scan cancelled by user request")
+                raise RequestCancelled("Elasticsearch request cancelled")
+
+            src = hit.get("_source", {})
+            docs.append(src)
+            if not sample_only and len(docs) >= max_docs:
+                break
+            if sample_only and len(docs) >= sample_size:
+                break
+    except RequestCancelled:
+        raise
+    except Exception:
+        logger.exception("Failed during Elasticsearch scan for index=%s", index)
+        raise
 
     if not docs:
         return pd.DataFrame()
 
-    return pd.json_normalize(docs, sep=".")
+    df = pd.json_normalize(docs, sep=".")
+    logger.info("Completed Elasticsearch scan index=%s rows=%s", index, len(df))
+    return df
 
 
 def isoformat(dt: datetime) -> str:

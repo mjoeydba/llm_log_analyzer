@@ -1,23 +1,23 @@
-"""Simple Tkinter-based desktop UI for the log analyzer.
-
-The desktop application exposes a subset of the Streamlit workflow so that
-analysts can work without launching a web browser. It reuses the shared helper
-functions defined in :mod:`core` for Elasticsearch access, summarisation and
-Ollama prompting.
-"""
+"""Simple Tkinter-based desktop UI for the log analyzer."""
 
 from __future__ import annotations
 
+import logging
+import os
+import threading
 import tkinter as tk
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from tkinter import messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import pandas as pd
 from dateutil import parser as dateparser
 
+from config_store import load_saved_connection, save_connection_config
 from core import (
+    RequestCancelled,
     build_query,
     build_single_period_prompt,
     connect_es,
@@ -26,9 +26,24 @@ from core import (
     ollama_generate,
     summarize_dataframe,
 )
+from logging_utils import (
+    attach_elasticsearch_handler,
+    detach_elasticsearch_handler,
+    ensure_file_logger,
+)
 
 
 CST = timezone(timedelta(hours=-6), name="CST")
+LOG_PATH = Path(os.environ.get("LLM_LOG_ANALYZER_LOG", Path.cwd() / "llm_log_analyzer.log"))
+CONFIG_PATH = Path(
+    os.environ.get(
+        "LLM_LOG_ANALYZER_CONFIG",
+        Path.home() / ".llm_log_analyzer_config.json",
+    )
+)
+
+ensure_file_logger(LOG_PATH)
+logger = logging.getLogger("llm_log_analyzer.desktop_gui")
 
 
 class DesktopApp:
@@ -38,12 +53,61 @@ class DesktopApp:
         self.root = root
         self.root.title("Elastic Data Explorer (Desktop)")
 
+        saved = load_saved_connection(CONFIG_PATH)
+
         self.es_client = None
+        self.es_log_handler = None
+        self.current_log_index: Optional[str] = None
+        self.cancel_requested = False
+        self.active_thread: Optional[threading.Thread] = None
+
         self.sample_df: pd.DataFrame = pd.DataFrame()
         self.current_df: pd.DataFrame = pd.DataFrame()
         self.available_fields: List[str] = []
 
+        self.host_var = tk.StringVar(
+            value=str(saved.get("host", os.environ.get("ES_HOST", "http://localhost:9200")))
+        )
+        self.index_var = tk.StringVar(
+            value=str(saved.get("index", os.environ.get("ES_INDEX", "logs-*")))
+        )
+        self.time_field_var = tk.StringVar(
+            value=str(saved.get("time_field", os.environ.get("ES_TIME_FIELD", "@timestamp")))
+        )
+        self.query_var = tk.StringVar(value=str(saved.get("query", "")))
+
+        auth_default = str(saved.get("auth_method", "None"))
+        if auth_default not in ("None", "Basic (username/password)", "API key"):
+            auth_default = "None"
+        self.auth_mode = tk.StringVar(value=auth_default)
+        self.username_var = tk.StringVar(value=str(saved.get("username", "")))
+        self.password_var = tk.StringVar(value=str(saved.get("password", "")))
+        self.api_key_var = tk.StringVar(value=str(saved.get("api_key", "")))
+        self.verify_certs_var = tk.BooleanVar(value=bool(saved.get("verify_certs", False)))
+        self.ca_certs_var = tk.StringVar(value=str(saved.get("ca_certs_path", "")))
+        self.log_index_var = tk.StringVar(value=str(saved.get("log_index", "")))
+
+        now = datetime.now(tz=CST)
+        default_start = now - timedelta(days=1)
+        self.start_var = tk.StringVar(value=str(saved.get("start", default_start.isoformat())))
+        self.end_var = tk.StringVar(value=str(saved.get("end", now.isoformat())))
+        self.max_docs_var = tk.StringVar(value=str(saved.get("max_docs", "5000")))
+        self.sample_size_var = tk.StringVar(value=str(saved.get("sample_size", "1000")))
+
+        self.ollama_host_var = tk.StringVar(
+            value=str(saved.get("ollama_host", os.environ.get("OLLAMA_HOST", "http://localhost:11434")))
+        )
+        self.model_var = tk.StringVar(
+            value=str(saved.get("model", os.environ.get("OLLAMA_MODEL", "llama3.1")))
+        )
+        self.temperature_var = tk.DoubleVar(value=float(saved.get("temperature", 0.2)))
+        self.max_tokens_var = tk.StringVar(value=str(saved.get("max_tokens", "0")))
+
+        self.status_var = tk.StringVar(value="Not connected")
+
         self._build_layout()
+        if saved:
+            self.status_var.set("Loaded saved connection settings")
 
     # ------------------------------------------------------------------
     # UI construction
@@ -57,11 +121,6 @@ class DesktopApp:
         # Connection frame
         conn_frame = ttk.LabelFrame(main, text="Elasticsearch Connection", padding=10)
         conn_frame.grid(row=0, column=0, sticky="nsew")
-
-        self.host_var = tk.StringVar(value="http://localhost:9200")
-        self.index_var = tk.StringVar(value="logs-*")
-        self.time_field_var = tk.StringVar(value="@timestamp")
-        self.query_var = tk.StringVar(value="*")
 
         ttk.Label(conn_frame, text="Host").grid(row=0, column=0, sticky="w")
         ttk.Entry(conn_frame, textvariable=self.host_var, width=40).grid(
@@ -83,17 +142,11 @@ class DesktopApp:
             row=3, column=1, sticky="ew"
         )
 
-        self.username_var = tk.StringVar()
-        self.password_var = tk.StringVar()
-        self.api_key_var = tk.StringVar()
-        self.ca_certs_var = tk.StringVar()
-        self.auth_mode = tk.StringVar(value="none")
-
         ttk.Label(conn_frame, text="Auth mode").grid(row=4, column=0, sticky="w")
         auth_menu = ttk.Combobox(
             conn_frame,
             textvariable=self.auth_mode,
-            values=("none", "basic", "api_key"),
+            values=("None", "Basic (username/password)", "API key"),
             state="readonly",
         )
         auth_menu.grid(row=4, column=1, sticky="ew")
@@ -111,13 +164,29 @@ class DesktopApp:
             row=7, column=1, sticky="ew"
         )
 
-        ttk.Label(conn_frame, text="CA bundle path").grid(row=8, column=0, sticky="w")
+        ttk.Checkbutton(
+            conn_frame,
+            text="Verify SSL certificates",
+            variable=self.verify_certs_var,
+        ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        ttk.Label(conn_frame, text="CA bundle path").grid(row=9, column=0, sticky="w")
         ttk.Entry(conn_frame, textvariable=self.ca_certs_var, width=40).grid(
-            row=8, column=1, sticky="ew"
+            row=9, column=1, sticky="ew"
         )
 
-        ttk.Button(conn_frame, text="Connect", command=self.connect).grid(
-            row=9, column=0, columnspan=2, pady=(8, 0)
+        ttk.Label(conn_frame, text="Log index (optional)").grid(row=10, column=0, sticky="w")
+        ttk.Entry(conn_frame, textvariable=self.log_index_var, width=40).grid(
+            row=10, column=1, sticky="ew"
+        )
+
+        buttons = ttk.Frame(conn_frame)
+        buttons.grid(row=11, column=0, columnspan=2, pady=(8, 0), sticky="ew")
+        ttk.Button(buttons, text="Connect", command=self.connect).pack(
+            side=tk.LEFT, expand=True, fill=tk.X
+        )
+        ttk.Button(buttons, text="Save settings", command=self.save_settings).pack(
+            side=tk.LEFT, expand=True, fill=tk.X
         )
 
         conn_frame.columnconfigure(1, weight=1)
@@ -126,30 +195,16 @@ class DesktopApp:
         fetch_frame = ttk.LabelFrame(main, text="Time range & Data", padding=10)
         fetch_frame.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
 
-        now = datetime.now(tz=CST)
-        default_start = now - timedelta(days=1)
-        self.start_var = tk.StringVar(value=default_start.isoformat())
-        self.end_var = tk.StringVar(value=now.isoformat())
-        self.max_docs_var = tk.StringVar(value="5000")
-        self.sample_size_var = tk.StringVar(value="1000")
-
         ttk.Label(fetch_frame, text="Start (ISO8601)").grid(row=0, column=0, sticky="w")
-        ttk.Entry(fetch_frame, textvariable=self.start_var).grid(
-            row=0, column=1, sticky="ew"
-        )
+        ttk.Entry(fetch_frame, textvariable=self.start_var).grid(row=0, column=1, sticky="ew")
         ttk.Label(fetch_frame, text="End (ISO8601)").grid(row=1, column=0, sticky="w")
-        ttk.Entry(fetch_frame, textvariable=self.end_var).grid(
-            row=1, column=1, sticky="ew"
+        ttk.Entry(fetch_frame, textvariable=self.end_var).grid(row=1, column=1, sticky="ew")
+        ttk.Button(fetch_frame, text="Choose…", command=self._open_time_popup).grid(
+            row=0, column=2, rowspan=2, padx=(8, 0)
         )
-        ttk.Button(
-            fetch_frame,
-            text="Choose…",
-            command=self._open_time_popup,
-        ).grid(row=0, column=2, rowspan=2, padx=(8, 0))
+
         ttk.Label(fetch_frame, text="Max docs").grid(row=2, column=0, sticky="w")
-        ttk.Entry(fetch_frame, textvariable=self.max_docs_var).grid(
-            row=2, column=1, sticky="ew"
-        )
+        ttk.Entry(fetch_frame, textvariable=self.max_docs_var).grid(row=2, column=1, sticky="ew")
         ttk.Label(fetch_frame, text="Sample size").grid(row=3, column=0, sticky="w")
         ttk.Entry(fetch_frame, textvariable=self.sample_size_var).grid(
             row=3, column=1, sticky="ew"
@@ -161,6 +216,13 @@ class DesktopApp:
         ttk.Button(fetch_frame, text="Fetch full data", command=self.fetch_data).grid(
             row=5, column=0, columnspan=2, pady=(6, 0)
         )
+        self.stop_button = ttk.Button(
+            fetch_frame,
+            text="Stop active request",
+            command=self.cancel_request,
+            state="disabled",
+        )
+        self.stop_button.grid(row=6, column=0, columnspan=2, pady=(6, 0))
 
         fetch_frame.columnconfigure(1, weight=1)
 
@@ -187,19 +249,12 @@ class DesktopApp:
         llm_frame = ttk.LabelFrame(main, text="Ollama", padding=10)
         llm_frame.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(10, 0))
 
-        self.ollama_host_var = tk.StringVar(value="http://localhost:11434")
-        self.model_var = tk.StringVar(value="llama3.1")
-        self.temperature_var = tk.DoubleVar(value=0.2)
-        self.max_tokens_var = tk.StringVar(value="0")
-
         ttk.Label(llm_frame, text="Host").grid(row=0, column=0, sticky="w")
         ttk.Entry(llm_frame, textvariable=self.ollama_host_var, width=30).grid(
             row=0, column=1, sticky="ew"
         )
         ttk.Label(llm_frame, text="Model").grid(row=1, column=0, sticky="w")
-        ttk.Entry(llm_frame, textvariable=self.model_var).grid(
-            row=1, column=1, sticky="ew"
-        )
+        ttk.Entry(llm_frame, textvariable=self.model_var).grid(row=1, column=1, sticky="ew")
         ttk.Label(llm_frame, text="Temperature").grid(row=2, column=0, sticky="w")
         ttk.Spinbox(
             llm_frame,
@@ -236,7 +291,6 @@ class DesktopApp:
         output_frame.columnconfigure(0, weight=1)
 
         # Status bar
-        self.status_var = tk.StringVar(value="Not connected")
         status = ttk.Label(main, textvariable=self.status_var, relief=tk.SUNKEN)
         status.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(6, 0))
 
@@ -247,6 +301,18 @@ class DesktopApp:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+    def _set_status(self, message: str) -> None:
+        self.status_var.set(message)
+
+    def _set_busy(self, busy: bool) -> None:
+        self.stop_button.configure(state="normal" if busy else "disabled")
+
+    def _show_error(self, title: str, message: str) -> None:
+        messagebox.showerror(title, message, parent=self.root)
+
+    def _show_warning(self, title: str, message: str) -> None:
+        messagebox.showwarning(title, message, parent=self.root)
+
     def _duration_to_timedelta(self, value: str, unit: str) -> timedelta:
         try:
             amount = float(value)
@@ -357,7 +423,6 @@ class DesktopApp:
                     else:
                         child.configure(state="normal" if enabled else "disabled")
                 except tk.TclError:
-                    # Widgets like labels might not support state changes; ignore.
                     pass
 
         def update_mode() -> None:
@@ -444,6 +509,8 @@ class DesktopApp:
     def _current_query(self):
         start_dt = self._parse_datetime(self.start_var.get())
         end_dt = self._parse_datetime(self.end_var.get())
+        if start_dt and end_dt and start_dt >= end_dt:
+            raise ValueError("Start must be before end")
         start_iso = isoformat(start_dt) if start_dt else None
         end_iso = isoformat(end_dt) if end_dt else None
         return build_query(
@@ -460,23 +527,87 @@ class DesktopApp:
         self.output_text.delete("1.0", tk.END)
         self.output_text.insert(tk.END, text)
 
+    def _start_worker(self, status_message: str, worker: Callable[[], None]) -> None:
+        if self.active_thread and self.active_thread.is_alive():
+            messagebox.showinfo("In progress", "Another request is already running.")
+            return
+
+        def run() -> None:
+            try:
+                worker()
+            finally:
+                self.cancel_requested = False
+                self.active_thread = None
+                self.root.after(0, lambda: self._set_busy(False))
+
+        logger.info(status_message)
+        self.cancel_requested = False
+        self._set_status(status_message)
+        self._set_busy(True)
+        thread = threading.Thread(target=run, daemon=True)
+        self.active_thread = thread
+        thread.start()
+
+    def _configure_log_handler(self) -> None:
+        root_logger = logging.getLogger("llm_log_analyzer")
+        index = self.log_index_var.get().strip()
+
+        if self.es_client and index:
+            if self.current_log_index and self.current_log_index != index and self.es_log_handler:
+                detach_elasticsearch_handler(root_logger, self.es_log_handler)
+                self.es_log_handler = None
+
+            try:
+                handler = attach_elasticsearch_handler(root_logger, self.es_client, index)
+                if handler is not self.es_log_handler:
+                    logger.info(
+                        "Streaming application logs to Elasticsearch index %s", index
+                    )
+                self.es_log_handler = handler
+                self.current_log_index = index
+            except Exception as exc:  # pragma: no cover - GUI feedback
+                logger.exception("Failed to attach Elasticsearch logging handler")
+                self._show_warning("Logging setup failed", str(exc))
+        else:
+            if self.es_log_handler:
+                detach_elasticsearch_handler(root_logger, self.es_log_handler)
+                logger.info("Stopped streaming application logs to Elasticsearch")
+            self.es_log_handler = None
+            self.current_log_index = None
+
     # ------------------------------------------------------------------
     # Actions
     # ------------------------------------------------------------------
+    def cancel_request(self) -> None:
+        if self.active_thread and self.active_thread.is_alive():
+            self.cancel_requested = True
+            logger.info("Cancellation requested by user")
+            self._set_status("Cancellation requested…")
+
     def connect(self) -> None:
         host = self.host_var.get().strip()
+        if not host:
+            self._show_error("Connection", "Host is required.")
+            return
+
         username = password = api_key = None
         mode = self.auth_mode.get()
-        if mode == "basic":
+        if mode == "Basic (username/password)":
             username = self.username_var.get().strip() or None
             password = self.password_var.get()
-        elif mode == "api_key":
+        elif mode == "API key":
             api_key = self.api_key_var.get().strip() or None
 
         ca_bundle = self.ca_certs_var.get().strip() or None
-        verify_certs = bool(ca_bundle)
+        verify_certs = bool(self.verify_certs_var.get())
 
         try:
+            logger.info(
+                "Attempting Elasticsearch connection host=%s index=%s auth=%s",
+                host,
+                self.index_var.get().strip(),
+                mode,
+            )
             self.es_client = connect_es(
                 host=host,
                 username=username,
@@ -485,65 +616,174 @@ class DesktopApp:
                 verify_certs=verify_certs,
                 ca_certs_path=ca_bundle,
             )
-            self.status_var.set("Connected to Elasticsearch")
+            self._set_status("Connected to Elasticsearch")
+            self._configure_log_handler()
         except Exception as exc:  # pragma: no cover - GUI feedback
-            messagebox.showerror("Connection failed", str(exc))
-            self.status_var.set("Connection failed")
+            logger.exception("Failed to connect to Elasticsearch")
+            self.es_client = None
+            self._configure_log_handler()
+            self._show_error("Connection failed", str(exc))
+            self._set_status("Connection failed")
+
+    def save_settings(self) -> None:
+        config = {
+            "host": self.host_var.get().strip(),
+            "index": self.index_var.get().strip(),
+            "time_field": self.time_field_var.get().strip(),
+            "auth_method": self.auth_mode.get(),
+            "username": self.username_var.get().strip(),
+            "password": self.password_var.get(),
+            "api_key": self.api_key_var.get().strip(),
+            "verify_certs": bool(self.verify_certs_var.get()),
+            "ca_certs_path": self.ca_certs_var.get().strip(),
+            "log_index": self.log_index_var.get().strip(),
+            "start": self.start_var.get().strip(),
+            "end": self.end_var.get().strip(),
+            "max_docs": self.max_docs_var.get().strip(),
+            "sample_size": self.sample_size_var.get().strip(),
+            "ollama_host": self.ollama_host_var.get().strip(),
+            "model": self.model_var.get().strip(),
+            "temperature": float(self.temperature_var.get()),
+            "max_tokens": self.max_tokens_var.get().strip(),
+        }
+        try:
+            save_connection_config(config, CONFIG_PATH)
+            self._set_status(f"Settings saved to {CONFIG_PATH}")
+            self._configure_log_handler()
+        except Exception as exc:  # pragma: no cover - GUI feedback
+            self._show_error("Save failed", str(exc))
 
     def fetch_sample(self) -> None:
         if not self._require_es():
             return
         try:
-            query = self._current_query()
             sample_size = int(self.sample_size_var.get())
-            df = fetch_dataframe(
-                es=self.es_client,
-                index=self.index_var.get().strip(),
-                query=query,
-                source_includes=None,
-                max_docs=sample_size,
-                sample_only=True,
-                sample_size=sample_size,
-            )
-            self.sample_df = df
-            self.available_fields = list(df.columns)
-            self.columns_list.delete(0, tk.END)
-            for col in self.available_fields:
-                self.columns_list.insert(tk.END, col)
-            if not self.available_fields:
-                self._update_output("No fields discovered in the sample.")
-            else:
-                self._update_output(
-                    f"Discovered {len(self.available_fields)} fields.\n"
-                    + df.head(10).to_string(index=False)
+            if sample_size <= 0:
+                raise ValueError
+        except ValueError:
+            self._show_error("Sample error", "Sample size must be a positive integer.")
+            return
+
+        try:
+            query = self._current_query()
+        except ValueError as exc:
+            self._show_error("Sample error", str(exc))
+            return
+
+        index = self.index_var.get().strip()
+
+        def worker() -> None:
+            try:
+                df = fetch_dataframe(
+                    es=self.es_client,
+                    index=index,
+                    query=query,
+                    source_includes=None,
+                    max_docs=sample_size,
+                    sample_only=True,
+                    sample_size=sample_size,
+                    cancel_callback=lambda: self.cancel_requested,
                 )
-        except Exception as exc:  # pragma: no cover - GUI feedback
-            messagebox.showerror("Sample error", str(exc))
+
+                def on_success() -> None:
+                    self.sample_df = df
+                    self.available_fields = list(df.columns)
+                    self.columns_list.delete(0, tk.END)
+                    for col in self.available_fields:
+                        self.columns_list.insert(tk.END, col)
+                    if not self.available_fields:
+                        self._update_output("No fields discovered in the sample.")
+                        self._set_status("Sample returned no data")
+                    else:
+                        preview = df.head(10).to_string(index=False)
+                        self._update_output(
+                            f"Discovered {len(self.available_fields)} fields.\n{preview}"
+                        )
+                        self._set_status(f"Sampled {len(df)} rows")
+
+                self.root.after(0, on_success)
+            except RequestCancelled:
+                logger.info("Sample fetch cancelled by user")
+
+                def on_cancel() -> None:
+                    self._update_output("Sample cancelled.")
+                    self._set_status("Sample cancelled")
+
+                self.root.after(0, on_cancel)
+            except Exception as exc:  # pragma: no cover - GUI feedback
+                logger.exception("Sample fetch failed")
+
+                def on_error() -> None:
+                    self._show_error("Sample error", str(exc))
+                    self._set_status("Sample failed")
+
+                self.root.after(0, on_error)
+
+        self._start_worker("Fetching sample…", worker)
 
     def fetch_data(self) -> None:
         if not self._require_es():
             return
+
+        try:
+            max_docs = int(self.max_docs_var.get())
+            if max_docs <= 0:
+                raise ValueError
+        except ValueError:
+            self._show_error("Fetch error", "Max docs must be a positive integer.")
+            return
+
         try:
             query = self._current_query()
-            max_docs = int(self.max_docs_var.get())
-            selected = self._selected_columns()
-            includes = list({*(selected or []), self.time_field_var.get()})
-            df = fetch_dataframe(
-                es=self.es_client,
-                index=self.index_var.get().strip(),
-                query=query,
-                source_includes=[c for c in includes if c],
-                max_docs=max_docs,
-                sample_only=False,
-            )
-            self.current_df = df
-            if df.empty:
-                self._update_output("No documents matched the current settings.")
-            else:
-                preview = df.head(20).to_string(index=False)
-                self._update_output(f"Fetched {len(df)} rows.\n\n{preview}")
-        except Exception as exc:  # pragma: no cover - GUI feedback
-            messagebox.showerror("Fetch error", str(exc))
+        except ValueError as exc:
+            self._show_error("Fetch error", str(exc))
+            return
+
+        index = self.index_var.get().strip()
+        selected = self._selected_columns()
+        includes = [col for col in dict.fromkeys([*(selected or []), self.time_field_var.get()]) if col]
+
+        def worker() -> None:
+            try:
+                df = fetch_dataframe(
+                    es=self.es_client,
+                    index=index,
+                    query=query,
+                    source_includes=includes,
+                    max_docs=max_docs,
+                    sample_only=False,
+                    cancel_callback=lambda: self.cancel_requested,
+                )
+
+                def on_success() -> None:
+                    self.current_df = df
+                    if df.empty:
+                        self._update_output("No documents matched the current settings.")
+                        self._set_status("Fetch completed – no rows returned")
+                    else:
+                        preview = df.head(20).to_string(index=False)
+                        self._update_output(f"Fetched {len(df)} rows.\n\n{preview}")
+                        self._set_status(f"Fetched {len(df)} rows")
+
+                self.root.after(0, on_success)
+            except RequestCancelled:
+                logger.info("Data fetch cancelled by user")
+
+                def on_cancel() -> None:
+                    self._update_output("Fetch cancelled.")
+                    self._set_status("Fetch cancelled")
+
+                self.root.after(0, on_cancel)
+            except Exception as exc:  # pragma: no cover - GUI feedback
+                logger.exception("Data fetch failed")
+
+                def on_error() -> None:
+                    self._show_error("Fetch error", str(exc))
+                    self._set_status("Fetch failed")
+
+                self.root.after(0, on_error)
+
+        self._start_worker("Fetching data…", worker)
 
     def run_analysis(self) -> None:
         if self.current_df.empty:
@@ -567,6 +807,7 @@ class DesktopApp:
                 supplemental=self.supplemental_text.get("1.0", tk.END).strip(),
             )
             max_tokens = int(self.max_tokens_var.get() or 0)
+            logger.info("Sending analysis prompt to Ollama model=%s", self.model_var.get().strip())
             response = ollama_generate(
                 model=self.model_var.get().strip(),
                 prompt=prompt,
@@ -575,8 +816,11 @@ class DesktopApp:
                 max_tokens=None if max_tokens == 0 else max_tokens,
             )
             self._update_output(response)
+            self._set_status("Analysis completed")
         except Exception as exc:  # pragma: no cover - GUI feedback
-            messagebox.showerror("Analysis error", str(exc))
+            logger.exception("Analysis failed")
+            self._show_error("Analysis error", str(exc))
+            self._set_status("Analysis failed")
 
     # ------------------------------------------------------------------
     # Column selection helpers

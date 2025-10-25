@@ -95,25 +95,113 @@ with colq1:
 with colq2:
     now = datetime.now(timezone.utc)
     default_start = now - timedelta(days=1)
-    window = st.date_input(
-        "Base period dates (for single-period analysis)",
-        value=(default_start.date(), now.date())
+    time_mode = st.radio(
+        "Time window mode",
+        ["Absolute range", "Relative to issue time"],
+        index=0,
+        help="Choose between a traditional start/end window or a window relative to when an issue occurred."
     )
-    # To capture precise times, add time inputs
-    col_t1, col_t2 = st.columns(2)
-    with col_t1:
-        start_time = st.time_input("Start time (UTC)", value=default_start.time())
-    with col_t2:
-        end_time = st.time_input("End time (UTC)", value=now.time())
 
-# Build ISO window for base period
-try:
-    start_dt = datetime.combine(window[0], start_time, tzinfo=timezone.utc)
-    end_dt = datetime.combine(window[1], end_time, tzinfo=timezone.utc)
-    start_iso = isoformat(start_dt)
-    end_iso = isoformat(end_dt)
-except Exception:
+    start_dt = end_dt = issue_dt = None
+
+    if time_mode == "Absolute range":
+        col_abs_dates = st.columns(2)
+        with col_abs_dates[0]:
+            start_date = st.date_input(
+                "Start date",
+                value=default_start.date(),
+                key="abs_start_date",
+                help="Click to open a calendar picker for the range start."
+            )
+        with col_abs_dates[1]:
+            end_date = st.date_input(
+                "End date",
+                value=now.date(),
+                key="abs_end_date",
+                help="Click to open a calendar picker for the range end."
+            )
+
+        # To capture precise times, add time inputs
+        col_t1, col_t2 = st.columns(2)
+        with col_t1:
+            start_time = st.time_input("Start time (UTC)", value=default_start.time(), key="abs_start_time")
+        with col_t2:
+            end_time = st.time_input("End time (UTC)", value=now.time(), key="abs_end_time")
+
+        try:
+            start_dt = datetime.combine(start_date, start_time, tzinfo=timezone.utc)
+            end_dt = datetime.combine(end_date, end_time, tzinfo=timezone.utc)
+        except Exception:
+            start_dt = end_dt = None
+
+    else:
+        issue_date = st.date_input(
+            "Issue date",
+            value=now.date(),
+            key="issue_date"
+        )
+        issue_time = st.time_input(
+            "Issue time (UTC)",
+            value=now.time(),
+            key="issue_time"
+        )
+        relative_input_mode = st.radio(
+            "Relative window input",
+            ["Number fields", "Slider"],
+            horizontal=True,
+            key="relative_input_mode",
+            help="Choose between numeric inputs or a slider to control the minutes before/after the issue time."
+        )
+
+        if relative_input_mode == "Slider":
+            slider_min = -24 * 60
+            slider_max = 24 * 60
+            offset_range = st.slider(
+                "Window offsets (minutes)",
+                min_value=slider_min,
+                max_value=slider_max,
+                value=(-60, 60),
+                step=5,
+                key="issue_window_slider",
+                help="Drag the handles to pick how many minutes before and after the issue time to search."
+            )
+            minutes_before = abs(min(offset_range[0], 0))
+            minutes_after = max(offset_range[1], 0)
+        else:
+            minutes_before = st.number_input(
+                "Minutes before issue",
+                min_value=0,
+                value=60,
+                step=5,
+                key="minutes_before_issue"
+            )
+            minutes_after = st.number_input(
+                "Minutes after issue",
+                min_value=0,
+                value=60,
+                step=5,
+                key="minutes_after_issue"
+            )
+
+        try:
+            issue_dt = datetime.combine(issue_date, issue_time, tzinfo=timezone.utc)
+            start_dt = issue_dt - timedelta(minutes=int(minutes_before))
+            end_dt = issue_dt + timedelta(minutes=int(minutes_after))
+            st.caption(
+                f"Searching from {start_dt.isoformat()} to {end_dt.isoformat()} (relative to issue time)."
+            )
+        except Exception:
+            start_dt = end_dt = None
+
+if start_dt and end_dt and start_dt >= end_dt:
+    st.error("Start time must be before end time. Adjust your selections.")
     start_iso = end_iso = None
+else:
+    try:
+        start_iso = isoformat(start_dt) if start_dt else None
+        end_iso = isoformat(end_dt) if end_dt else None
+    except Exception:
+        start_iso = end_iso = None
 
 # -------------------------------
 # Pull sample + choose fields
